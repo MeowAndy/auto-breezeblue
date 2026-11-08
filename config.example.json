@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "accounts": [
+    {
+      "id": "ab12cd34",
+      "name": "我的主号",
+      "email": "",
+      "password": "",
+      "cookie": "breeze_blue_session=xxxxxxxxxxxxxxxxxxxxxxxx; breeze_locale=zh",
+      "enabled": true,
+      "reward_tier": "",
+      "added_at": "2026-01-01 08:00:00",
+      "last_result": null
+    }
+  ]
+}
