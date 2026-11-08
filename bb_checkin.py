@@ -21,18 +21,22 @@ BreezeBlue 每日积分自动签到 —— 核心库 + 命令行(多账号版)
 
 命令行:
   python bb_checkin.py run             # 签到所有启用的账号(供计划任务调用)
+  python bb_checkin.py watch           # 常驻守护模式:按各账号积分重置时间自动领取
+                                       #   (无 systemd/cron 的环境如 Docker 的兜底方案)
   python bb_checkin.py list            # 列出账号
   python bb_checkin.py add "cookie..." # 添加账号(粘贴 Cookie 串)
   python bb_checkin.py test            # 测试所有账号登录态,不签到
   python bb_checkin.py status          # 查看配置与最近结果
   python bb_checkin.py install 08:05   # 注册每日计划任务(Windows: schtasks;
-                                       #   Linux: systemd 用户定时器,回退 crontab)
-  python bb_checkin.py remove          # 移除计划任务
+                                       #   Linux: systemd 用户/系统定时器 ->
+                                       #   crontab -> watch 守护进程,自动逐级回退)
+  python bb_checkin.py remove          # 移除计划任务/守护进程
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -40,7 +44,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -66,6 +70,7 @@ IS_WINDOWS = sys.platform == "win32"
 SYSTEMD_SERVICE = "breezeblue-checkin.service"
 SYSTEMD_TIMER = "breezeblue-checkin.timer"
 CRON_MARKER = "# BB-CHECKIN-JOB"
+WATCH_PID_FILE = SCRIPT_DIR / "watch.pid"
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -522,7 +527,10 @@ def _norm_time(time_hhmm: str) -> str | None:
 def _run_quiet(args: list[str], input_text: str | None = None) -> tuple[int, str]:
     """静默执行命令,可靠解码输出(bytes 模式,输入显式 UTF-8 编码)。"""
     stdin_bytes = input_text.encode("utf-8") if input_text is not None else None
-    r = subprocess.run(args, capture_output=True, input=stdin_bytes)
+    try:
+        r = subprocess.run(args, capture_output=True, input=stdin_bytes)
+    except FileNotFoundError:
+        return 127, f"command not found: {args[0]}"
 
     def dec(b: bytes) -> str:
         for enc in ("utf-8", "gbk"):
@@ -665,27 +673,104 @@ WantedBy=timers.target
 
     # ---- 回退: crontab ----
     if shutil.which("crontab"):
-        cmd = f"cd {SCRIPT_DIR} && {py} {script} run >> {LOG_DIR / 'cron.log'} 2>&1 {CRON_MARKER}"
-        code, out = _run_quiet(["crontab", "-l"])
-        lines = out.splitlines() if code == 0 else []
-        lines = [ln for ln in lines if CRON_MARKER not in ln]
-        lines.append(f"{int(mm)} {int(hh)} * * * {cmd}")
-        lines.append(f"@reboot {cmd}")
-        code2, out2 = _run_quiet(["crontab", "-"], input_text="\n".join(lines) + "\n")
-        if code2 == 0:
-            extra = f"; systemd 不可用({systemd_err})" if systemd_err else ""
-            msg = (f"crontab 已注册 ✅ 每日 {time_hhmm} + @reboot 补签; {tz_note}{extra}")
+        ok, msg = _install_crontab(hh, mm, py, script)
+        if ok:
             return True, msg
-        return False, (f"crontab 写入失败: {out2[:150]}"
-                       + (f"; systemd 也不可用({systemd_err})" if systemd_err else "; systemd 不可用"))
+        crontab_err = msg
+    else:
+        crontab_err = "crontab 未安装"
 
-    return False, ("系统无 systemd 用户会话也无 crontab,无法注册定时任务"
-                   + (f"({systemd_err})" if systemd_err else ""))
+    # ---- 回退: system 级 systemd 定时器(root 或免密 sudo) ----
+    ok, msg = _install_system_timer(time_hhmm, py, script)
+    if ok:
+        return True, msg
+    systemd_sys_err = msg
+
+    # ---- 最终兜底: watch 常驻守护进程(任何环境可跑,Docker 亦适用) ----
+    ok, msg = _spawn_watch()
+    if ok:
+        return True, (f"watch 守护进程已启动 ✅(按各账号积分重置时间自动领取); "
+                      f"此前: {crontab_err}; system 级 systemd: {systemd_sys_err}")
+    return False, (f"所有定时方案均失败: crontab({crontab_err}); "
+                   f"system 级 systemd({systemd_sys_err}); watch({msg})。"
+                   "若是 Docker 容器,可手动运行: python3 bb_checkin.py watch")
+
+
+def _install_crontab(hh: str, mm: str, py: str, script: Path) -> tuple[bool, str]:
+    cmd = f"cd {SCRIPT_DIR} && {py} {script} run >> {LOG_DIR / 'cron.log'} 2>&1 {CRON_MARKER}"
+    code, out = _run_quiet(["crontab", "-l"])
+    lines = out.splitlines() if code == 0 else []
+    lines = [ln for ln in lines if CRON_MARKER not in ln]
+    lines.append(f"{int(mm)} {int(hh)} * * * {cmd}")
+    lines.append(f"@reboot {cmd}")
+    code2, out2 = _run_quiet(["crontab", "-"], input_text="\n".join(lines) + "\n")
+    if code2 == 0:
+        return True, f"crontab 已注册 ✅ 每日 {hh}:{mm} + @reboot 补签"
+    return False, f"写入失败 {out2[:150]}"
+
+
+def _install_system_timer(time_hhmm: str, py: str, script: Path) -> tuple[bool, str]:
+    """system 级 systemd 定时器,需要 root 或免密 sudo。"""
+    import getpass
+    euid = getattr(os, "geteuid", lambda: 1)()
+    sudo: list[str] = []
+    if euid != 0:
+        code, _out = _run_quiet(["sudo", "-n", "true"])
+        if code != 0:
+            return False, "需要 root 或免密 sudo"
+        sudo = ["sudo"]
+
+    hh, mm = time_hhmm.split(":")
+    user = getpass.getuser()
+    service = f"""\
+[Unit]
+Description=BreezeBlue daily credits check-in
+
+[Service]
+Type=oneshot
+User={user}
+WorkingDirectory={SCRIPT_DIR}
+ExecStart={py} {script} run
+"""
+    timer = f"""\
+[Unit]
+Description=Run BreezeBlue check-in daily at {time_hhmm}
+
+[Timer]
+OnCalendar=*-*-* {hh}:{mm}:00
+Persistent=true
+Unit={SYSTEMD_SERVICE}
+
+[Install]
+WantedBy=multi-user.target
+"""
+    rcode, rout = _run_quiet(
+        [*sudo, "tee", f"/etc/systemd/system/{SYSTEMD_SERVICE}"],
+        input_text=service,
+    )
+    if rcode != 0:
+        return False, rout[:150]
+    rcode, rout = _run_quiet(
+        [*sudo, "tee", f"/etc/systemd/system/{SYSTEMD_TIMER}"],
+        input_text=timer,
+    )
+    if rcode != 0:
+        return False, rout[:150]
+    _run_quiet([*sudo, "systemctl", "daemon-reload"])
+    code, out = _run_quiet([*sudo, "systemctl", "enable", "--now", SYSTEMD_TIMER])
+    if code != 0:
+        return False, out[:150]
+    return True, (f"system 级 systemd 定时器已启用 ✅ 每日 {time_hhmm}; {tz_note()}; "
+                  "Persistent=true 错过自动补跑")
+
+
+def tz_note() -> str:
+    return "(按服务器本地时间;若时区为 UTC,建议设 00:05 对应北京时间 08:05)"
 
 
 def _remove_linux() -> tuple[bool, str]:
-    msgs = []
-    # systemd
+    msgs = [_stop_watch()]
+    # systemd 用户级
     _run_quiet(["systemctl", "--user", "disable", "--now", SYSTEMD_TIMER])
     unit_dir = Path.home() / ".config" / "systemd" / "user"
     removed_unit = False
@@ -696,7 +781,15 @@ def _remove_linux() -> tuple[bool, str]:
             removed_unit = True
     if removed_unit:
         _run_quiet(["systemctl", "--user", "daemon-reload"])
-        msgs.append("systemd 定时器: 已移除")
+        msgs.append("systemd 用户定时器: 已移除")
+    # systemd 系统级
+    code, _t = _run_quiet(["systemctl", "is-enabled", SYSTEMD_TIMER])
+    if code == 0:
+        _run_quiet(["systemctl", "disable", "--now", SYSTEMD_TIMER])
+        for f in (SYSTEMD_TIMER, SYSTEMD_SERVICE):
+            _run_quiet(["rm", "-f", f"/etc/systemd/system/{f}"])
+        _run_quiet(["systemctl", "daemon-reload"])
+        msgs.append("systemd 系统定时器: 已移除")
     # cron
     if shutil.which("crontab"):
         code, out = _run_quiet(["crontab", "-l"])
@@ -704,8 +797,8 @@ def _remove_linux() -> tuple[bool, str]:
             kept = [ln for ln in out.splitlines() if CRON_MARKER not in ln]
             _run_quiet(["crontab", "-"], input_text=("\n".join(kept) + "\n") if kept else "")
             msgs.append("crontab 任务: 已移除")
-    if not msgs:
-        msgs.append("未发现已注册的任务")
+    if len(msgs) == 1:
+        msgs.append("未发现其他已注册的任务")
     return True, "; ".join(msgs)
 
 
@@ -714,7 +807,7 @@ def _status_linux() -> dict:
     if shutil.which("systemctl"):
         code, _t = _run_quiet(["systemctl", "--user", "is-enabled", SYSTEMD_TIMER])
         if code == 0:
-            out["daily"] = {"installed": True, "status": "systemd timer 已启用"}
+            out["daily"] = {"installed": True, "status": "systemd 用户定时器已启用"}
             _c, text = _run_quiet([
                 "systemctl", "--user", "list-timers", SYSTEMD_TIMER,
                 "--no-pager",
@@ -725,17 +818,139 @@ def _status_linux() -> dict:
                 out["daily"]["next_run"] = m.group(1)
             out["logon"] = {"installed": True, "status": "Persistent=true,错过自动补跑"}
             return out
+        code, text = _run_quiet(["systemctl", "is-enabled", SYSTEMD_TIMER])
+        if code == 0:
+            out["daily"] = {"installed": True, "status": "system 级 systemd 定时器已启用"}
+            out["logon"] = {"installed": True, "status": "Persistent=true,错过自动补跑"}
+            return out
     if shutil.which("crontab"):
         code, text = _run_quiet(["crontab", "-l"])
         if code == 0 and any(CRON_MARKER in ln for ln in text.splitlines()):
             out["daily"] = {"installed": True, "status": "crontab 已注册(每日 + @reboot)"}
             out["logon"] = {"installed": True, "status": "@reboot 补签"}
+            return out
+    # watch 守护进程
+    pid = _watch_pid()
+    if pid:
+        out["daily"] = {"installed": True,
+                        "status": f"watch 守护进程运行中(PID {pid}),按重置时间自动领取"}
+        out["logon"] = {"installed": True, "status": "常驻进程,无需补签"}
     return out
+
+
+# ---------------- watch 常驻守护进程(终极兜底,Docker 亦适用) ----------------
+def _watch_pid() -> int | None:
+    """读取 PID 文件并确认进程仍存活;无效返回 None。"""
+    try:
+        pid = int(WATCH_PID_FILE.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    if IS_WINDOWS:
+        _code, out = _run_quiet(["tasklist", "/FI", f"PID eq {pid}", "/NH"])
+        alive = str(pid) in out
+    else:
+        code, _out = _run_quiet(["kill", "-0", str(pid)])
+        alive = code == 0
+    return pid if alive else None
+
+
+def _spawn_watch() -> tuple[bool, str]:
+    pid = _watch_pid()
+    if pid:
+        return True, f"watch 守护进程已在运行(PID {pid})"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / "watch.log"
+    with open(log_path, "ab") as lf:
+        p = subprocess.Popen(
+            [sys.executable, str(SCRIPT_DIR / "bb_checkin.py"), "watch"],
+            stdout=lf, stderr=lf, stdin=subprocess.DEVNULL,
+            cwd=str(SCRIPT_DIR),
+            start_new_session=not IS_WINDOWS,
+        )
+    time.sleep(1.2)
+    if p.poll() is None:
+        return True, f"watch 守护进程已启动(PID {p.pid}),日志: {log_path}"
+    return False, f"启动失败,详见 {log_path}"
+
+
+def _stop_watch() -> str:
+    pid = _watch_pid()
+    if not pid:
+        return "watch 守护进程: 未在运行"
+    try:
+        if IS_WINDOWS:
+            _run_quiet(["taskkill", "/PID", str(pid), "/F"])
+        else:
+            _run_quiet(["kill", str(pid)])
+        WATCH_PID_FILE.unlink(missing_ok=True)
+        return f"watch 守护进程: 已停止(原 PID {pid})"
+    except OSError as e:
+        return f"watch 守护进程: 停止失败 {e}"
+
+
+def _parse_iso_utc(s: str) -> float | None:
+    try:
+        dt = datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _watch_next_sleep() -> float:
+    """按各账号 daily_claim_next_reset_at 计算下次唤醒秒数(60s~6h,兜底 1h)。"""
+    now = time.time()
+    candidates: list[float] = []
+    for acct in get_accounts():
+        if not acct.get("enabled", True):
+            continue
+        cookie = (acct.get("cookie") or "").strip()
+        if not cookie:
+            continue
+        try:
+            ok, s = credits_summary(cookie)
+        except Exception:  # noqa: BLE001
+            continue
+        if ok and isinstance(s, dict):
+            ts = _parse_iso_utc(str(s.get("daily_claim_next_reset_at") or ""))
+            if ts and ts > now:
+                candidates.append(ts + 90)  # 重置后 90 秒缓冲
+    if not candidates:
+        return 3600.0
+    return max(60.0, min(min(candidates) - now, 21600.0))
+
+
+def cmd_watch() -> int:
+    """常驻模式:循环为所有启用账号签到,醒来时间对齐最近的积分重置点。"""
+    pid = _watch_pid()
+    if pid:
+        print(f"已有 watch 守护进程在运行(PID {pid}),如需重启先执行: python bb_checkin.py remove")
+        return 1
+    WATCH_PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    log("watch 守护进程启动(按积分重置时间自动领取)")
+    try:
+        while True:
+            try:
+                for acct in [a for a in get_accounts() if a.get("enabled", True)]:
+                    run_checkin_account(acct)
+            except Exception as e:  # noqa: BLE001
+                log(f"watch 轮次异常: {e!r}")
+            sleep_s = _watch_next_sleep()
+            log(f"watch 下次检查: {int(sleep_s)}s 后")
+            deadline = time.time() + sleep_s
+            while time.time() < deadline:
+                time.sleep(min(600.0, max(0.0, deadline - time.time())))
+    finally:
+        try:
+            WATCH_PID_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # ---------------- 对外接口 ----------------
 def install_tasks(time_hhmm: str = "08:05") -> tuple[bool, str]:
-    """注册每日自动签到任务(Windows 计划任务 / Linux systemd+crontab)。"""
+    """注册每日自动签到任务(Windows 计划任务 / Linux systemd+crontab+watch)。"""
     t = _norm_time(time_hhmm)
     if not t:
         return False, "时间格式应为 HH:MM,例如 08:05"
@@ -865,6 +1080,8 @@ def main(argv: list[str]) -> int:
         ok, msg = remove_tasks()
         print(msg)
         return 0
+    if cmd == "watch":
+        return cmd_watch()
     print(__doc__)
     return 0
 
