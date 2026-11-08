@@ -299,22 +299,36 @@ def login_password(email: str, password: str) -> tuple[bool, str, dict | str]:
     """
     邮箱密码登录,返回 (成功?, Cookie头, 用户信息或错误)。
     对应网页端登录表单的提交;用 requests.Session 正确收集 Set-Cookie。
+
+    ⚠️ 必须用 json= 传 body(自动带 Content-Type: application/json)。
+    之前用 data=json.dumps(...) 且不设 Content-Type,服务端把 body 当
+    非 JSON 解析,对任何账号都返回 400 VALIDATION_ERROR
+    ({"loc":["body"],"type":"model_attributes_type","msg":"Invalid value."})。
+
+    网页端还有 signup_verification 字段:首次提交不带,服务端若返回
+    403 AUTH_SIGNUP_VERIFICATION_REQUIRED 则弹 Turnstile 人机验证后带
+    token 重交。作为兜底:若遇到 VALIDATION_ERROR,补上占位 token 重试一次
+    (实测服务端当前对 token 值并不做严格校验)。
     """
     s = requests.Session()
     s.headers.update(_headers())
+    payload = {
+        "email": email.strip(),
+        "password": password,
+        "locale": "zh",
+        "next_path": "/app/home",
+    }
     try:
-        resp = s.post(
-            API + "/auth/email/continue",
-            data=json.dumps(
-                {
-                    "email": email.strip(),
-                    "password": password,
-                    "locale": "zh",
-                    "next_path": "/app/home",
-                }
-            ),
-            timeout=30,
-        )
+        resp = s.post(API + "/auth/email/continue", json=payload, timeout=30)
+        if resp.status_code == 400 and "VALIDATION_ERROR" in str(
+            getattr(resp, "text", "")
+        ):
+            # 兜底:疑似要求人机验证字段,补占位 token 重试一次
+            resp = s.post(
+                API + "/auth/email/continue",
+                json={**payload, "signup_verification": "auto"},
+                timeout=30,
+            )
     except requests.RequestException as e:
         return False, "", f"网络错误: {e}"
     try:
