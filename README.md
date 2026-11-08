@@ -1,6 +1,6 @@
 # 🌊 auto-breezeblue
 
-[**BreezeBlue**](https://breezeblue.ai/)(AI 语音平台)每日积分自动签到工具 —— **多账号管理 + 本地 Web 面板 + Windows 计划任务**,纯本地运行,凭据不出本机。
+[**BreezeBlue**](https://breezeblue.ai/)(AI 语音平台)每日积分自动签到工具 —— **多账号管理 + 本地 Web 面板 + 定时任务**,纯本地运行,凭据不出本机。**支持 Windows 与 Linux**(Linux 使用 systemd 定时器 / crontab)。
 
 ## ✨ 功能
 
@@ -16,20 +16,23 @@
 
 ## 🚀 快速开始
 
-> 要求:Windows 10/11、Python 3.10+
+> 要求:Python 3.10+、`requests`(Windows 10/11 与 Linux 均可)
 
-```bat
+```bash
 git clone https://github.com/MeowAndy/auto-breezeblue.git
 cd auto-breezeblue
 pip install -r requirements.txt
 ```
 
-双击 **`启动签到面板.bat`**,浏览器会自动打开 `http://127.0.0.1:8765/`,然后:
+- **Windows**:双击 `启动签到面板.bat`
+- **Linux/macOS**:`./start_panel.sh`
 
-1. 点「**＋ 添加账号**」
-2. 浏览器登录 breezeblue.ai → 按 `F12` 打开开发者工具 → 切到 **Network/网络** → 按 `F5` 刷新 → 点任意一条发往 `breezeblue.ai` 的请求 → 在 **Request Headers/请求标头** 里复制 `Cookie:` 后面的全部内容 → 粘贴进弹窗保存
-   (也支持直接粘贴 **Copy as cURL** 的全文,会自动提取)
-3. 点「**✅ 开启**」注册每日计划任务,完成!
+浏览器会自动打开 `http://127.0.0.1:8765/`,然后:
+
+1. 点「**＋ 添加账号**」,两种方式**二选一**:
+   - **方式一 · Cookie 凭证(推荐)**:浏览器登录 breezeblue.ai → `F12` → Network/网络 → `F5` 刷新 → 点任意一条请求 → 在 Request Headers 里复制 `Cookie:` 后面的全部内容 → 粘贴保存
+   - **方式二 · 邮箱 + 密码**:真实登录一次换取会话,成功才保存
+2. 点「**✅ 开启**」注册每日定时任务(默认 08:05),完成!
 
 ## 🖥️ 面板预览
 
@@ -65,6 +68,45 @@ python bb_checkin.py install 08:05       :: 注册每日计划任务
 python bb_checkin.py remove              :: 移除计划任务
 ```
 
+## 🐧 Linux 服务器部署
+
+```bash
+git clone https://github.com/MeowAndy/auto-breezeblue.git
+cd auto-breezeblue
+pip3 install -r requirements.txt
+```
+
+**方式 A:SSH 隧道(推荐,安全)**
+
+```bash
+./start_panel.sh                  # 面板只监听 127.0.0.1
+# 本地电脑执行:ssh -L 8765:127.0.0.1:8765 user@服务器IP
+# 然后本地浏览器打开 http://127.0.0.1:8765 配置账号
+```
+
+**方式 B:公网/LAN 直接访问(必须带令牌)**
+
+```bash
+./start_panel.sh --host 0.0.0.0 --port 8765 --token 你的口令
+# 不传 --token 会自动生成一个并打印在控制台/日志里
+# 页面通过 http://服务器IP:8765/?token=你的口令 首次访问,浏览器会记住
+```
+
+**注册每日定时任务**(与 Windows 同一条命令):
+
+```bash
+python3 bb_checkin.py install 08:05
+python3 bb_checkin.py status      # 查看状态
+python3 bb_checkin.py remove      # 移除
+```
+
+- 优先使用 **systemd 用户定时器**(`~/.config/systemd/user/breezeblue-checkin.timer`),
+  `Persistent=true`:到点时服务器关机/重启错过的话,下次可用时**自动补跑**
+- systemd 用户会话不可用时自动回退 **crontab**(每日任务 + `@reboot` 补签)
+- ⚠️ `OnCalendar` 按**服务器本地时间**触发:若服务器时区为 UTC,建议设 `00:05`
+  (= 北京时间 08:05);用 `timedatectl` 查看时区
+- 建议(可选):`sudo loginctl enable-linger $USER`,让用户级定时器在未登录时也运行
+
 ## ⚙️ 工作原理(逆向自官网前端)
 
 | 步骤 | 接口 | 说明 |
@@ -74,9 +116,9 @@ python bb_checkin.py remove              :: 移除计划任务
 | 签到 | `POST /api/credits/daily-claim` | 成功 `{"claimed":true,"credits_issued":400.0}`;重复 `{"already_claimed":true}`;档位服务端自动判定,无需传参 |
 | 余额 | `GET /api/credits/summary` | 余额、今日是否已签、下次重置时间等 |
 
-- 积分每天 **UTC 00:00(北京时间 08:00)** 重置,建议任务时间设在 08:05 之后
+- 积分每天 **UTC 00:00(北京时间 08:00)** 重置(固定每日重置,已实测确认),建议任务时间设在 08:05 之后
 - 新账号**注册**才需要 Cloudflare Turnstile 人机验证,已有账号的登录/签到不需要,所以脚本可行
-- 计划任务通过 `schtasks` 注册,每天定时执行 `python bb_checkin.py run`,另有 `ONLOGON` 开机补签任务
+- 定时任务:Windows 通过 `schtasks` 注册每日任务 + `ONLOGON` 开机补签;Linux 通过 systemd 用户定时器(`Persistent=true` 错过自动补跑)或 crontab(`@reboot` 补签),到点执行 `bb_checkin.py run` 为所有启用账号签到
 
 ## ❓ FAQ
 
@@ -90,10 +132,12 @@ python bb_checkin.py remove              :: 移除计划任务
 点「＋ 添加账号」逐个加入即可。注意:同一浏览器登出再登另一个账号后,记得重新抓 Cookie(旧账号的会话可能已随登出失效)。
 
 **关机错过了签到时间怎么办?**
-开机补签任务(`ONLOGON`)会在下次开机时自动补签一次,当天已签过会直接跳过。若当天一直没开机,则该天积分无法补领。
+Windows 的开机补签任务(`ONLOGON`)、Linux systemd 的 `Persistent=true` / crontab `@reboot`
+都会在下次可用时自动补签一次,当天已签过会直接跳过。若当天一直没开机,则该天积分无法补领。
 
 **安全吗?**
-面板只监听 `127.0.0.1`,外部访问不到;`config.json` 明文保存凭据,已被 `.gitignore` 排除,请勿外传。
+面板默认只监听 `127.0.0.1`,外部访问不到;绑定 `0.0.0.0` 远程访问时会强制启用访问令牌
+(`--token` 或自动生成)。`config.json` 明文保存凭据,已被 `.gitignore` 排除,请勿外传。
 
 ## ⚠️ 免责声明
 

@@ -25,7 +25,8 @@ BreezeBlue 每日积分自动签到 —— 核心库 + 命令行(多账号版)
   python bb_checkin.py add "cookie..." # 添加账号(粘贴 Cookie 串)
   python bb_checkin.py test            # 测试所有账号登录态,不签到
   python bb_checkin.py status          # 查看配置与最近结果
-  python bb_checkin.py install 08:05   # 注册每日计划任务(含开机补签)
+  python bb_checkin.py install 08:05   # 注册每日计划任务(Windows: schtasks;
+                                       #   Linux: systemd 用户定时器,回退 crontab)
   python bb_checkin.py remove          # 移除计划任务
 """
 
@@ -33,6 +34,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -57,6 +59,13 @@ LOG_PATH = LOG_DIR / "checkin.log"
 TASK_NAME_DAILY = "BreezeBlueDailyCheckin"
 TASK_NAME_LOGON = "BreezeBlueCheckinLogon"
 TASK_ARGS = "run"
+
+IS_WINDOWS = sys.platform == "win32"
+
+# Linux 计划任务单元名(用户级 systemd)
+SYSTEMD_SERVICE = "breezeblue-checkin.service"
+SYSTEMD_TIMER = "breezeblue-checkin.timer"
+CRON_MARKER = "# BB-CHECKIN-JOB"
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -496,18 +505,24 @@ def run_checkin_all() -> dict:
 
 
 # ----------------------------------------------------------------------------
-# Windows 计划任务
+# 计划任务(Windows: schtasks / Linux: systemd 用户定时器,回退 crontab)
 # ----------------------------------------------------------------------------
 def _task_command() -> str:
     return f'"{sys.executable}" "{SCRIPT_DIR / "bb_checkin.py"}" {TASK_ARGS}'
 
 
-def _schtasks(args: list[str]) -> tuple[int, str]:
-    """
-    执行 schtasks 并可靠解码输出,返回 (returncode, 合并的文本输出)。
-    中文 Windows 下 schtasks 输出为 GBK,不能用 text=True(UTF-8 解码会崩)。
-    """
-    r = subprocess.run(["schtasks", *args], capture_output=True)
+def _norm_time(time_hhmm: str) -> str | None:
+    """校验并规范化 HH:MM,非法返回 None。"""
+    if not re.fullmatch(r"\d{1,2}:\d{2}", time_hhmm or ""):
+        return None
+    hh, mm = time_hhmm.split(":")
+    return f"{int(hh):02d}:{int(mm):02d}"
+
+
+def _run_quiet(args: list[str], input_text: str | None = None) -> tuple[int, str]:
+    """静默执行命令,可靠解码输出(bytes 模式,输入显式 UTF-8 编码)。"""
+    stdin_bytes = input_text.encode("utf-8") if input_text is not None else None
+    r = subprocess.run(args, capture_output=True, input=stdin_bytes)
 
     def dec(b: bytes) -> str:
         for enc in ("utf-8", "gbk"):
@@ -520,13 +535,16 @@ def _schtasks(args: list[str]) -> tuple[int, str]:
     return r.returncode, (dec(r.stderr) + "\n" + dec(r.stdout)).strip()
 
 
-def install_tasks(time_hhmm: str = "08:05") -> tuple[bool, str]:
-    """注册每日签到任务 + 开机补签任务(后者尽力而为)。"""
-    if not re.fullmatch(r"\d{1,2}:\d{2}", time_hhmm):
-        return False, "时间格式应为 HH:MM,例如 08:05"
-    hh, mm = time_hhmm.split(":")
-    time_hhmm = f"{int(hh):02d}:{int(mm):02d}"
+# ---------------- Windows ----------------
+def _schtasks(args: list[str]) -> tuple[int, str]:
+    """
+    执行 schtasks 并可靠解码输出。
+    中文 Windows 下 schtasks 输出为 GBK,不能用 text=True(UTF-8 解码会崩)。
+    """
+    return _run_quiet(["schtasks", *args])
 
+
+def _install_windows(time_hhmm: str) -> tuple[bool, str]:
     tr = _task_command()
     msgs = []
 
@@ -550,23 +568,18 @@ def install_tasks(time_hhmm: str = "08:05") -> tuple[bool, str]:
     logon_ok = code2 == 0
     msgs.append("开机补签: " + ("成功" if logon_ok else "失败(不影响每日任务) " + out2[:150]))
 
-    ok = daily_ok
-    summary = "; ".join(msgs)
-    log("计划任务注册 -> " + summary)
-    return ok, summary
+    return daily_ok, "; ".join(msgs)
 
 
-def remove_tasks() -> tuple[bool, str]:
+def _remove_windows() -> tuple[bool, str]:
     msgs = []
     for name in (TASK_NAME_DAILY, TASK_NAME_LOGON):
         code, _out = _schtasks(["/Delete", "/F", "/TN", name])
         msgs.append(f"{name}: {'已移除' if code == 0 else '不存在或移除失败'}")
-    log("计划任务移除 -> " + "; ".join(msgs))
     return True, "; ".join(msgs)
 
 
-def task_status() -> dict:
-    """查询两个计划任务的当前状态。"""
+def _status_windows() -> dict:
     out = {}
     for key, name in (("daily", TASK_NAME_DAILY), ("logon", TASK_NAME_LOGON)):
         code, text = _schtasks(["/Query", "/TN", name, "/FO", "LIST", "/V"])
@@ -582,6 +595,171 @@ def task_status() -> dict:
             info["status"] = m.group(1).strip()
         out[key] = info
     return out
+
+
+# ---------------- Linux ----------------
+def _systemd_available() -> bool:
+    """
+    systemd 用户会话是否真的可用。
+    `is-system-running` 退出码 1 可能是 degraded(可用)也可能是
+    "Failed to connect to bus"(不可用),必须看输出文本区分。
+    """
+    if not shutil.which("systemctl"):
+        return False
+    code, out = _run_quiet(["systemctl", "--user", "is-system-running"])
+    text = out.lower()
+    if "failed to connect" in text or "not booted" in text or text.strip() == "offline":
+        return False
+    return code in (0, 1)  # running / degraded / starting 都可用
+
+
+def _install_linux(time_hhmm: str) -> tuple[bool, str]:
+    """systemd 用户定时器(错过自动补跑);systemd 不可用或失败时回退 crontab。"""
+    hh, mm = time_hhmm.split(":")
+    py = sys.executable
+    script = SCRIPT_DIR / "bb_checkin.py"
+    tz_note = "(按服务器本地时间;若时区为 UTC,建议设 00:05 对应北京时间 08:05)"
+    systemd_err = ""
+
+    # ---- 尝试 systemd 用户定时器 ----
+    if _systemd_available():
+        unit_dir = Path.home() / ".config" / "systemd" / "user"
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        service = f"""\
+[Unit]
+Description=BreezeBlue daily credits check-in
+
+[Service]
+Type=oneshot
+WorkingDirectory={SCRIPT_DIR}
+ExecStart={py} {script} run
+"""
+        timer = f"""\
+[Unit]
+Description=Run BreezeBlue check-in daily at {time_hhmm}
+
+[Timer]
+OnCalendar=*-*-* {hh}:{mm}:00
+# 错过(如关机/重启中)则在下次可用时自动补跑一次
+Persistent=true
+Unit={SYSTEMD_SERVICE}
+
+[Install]
+WantedBy=timers.target
+"""
+        try:
+            (unit_dir / SYSTEMD_SERVICE).write_text(service, encoding="utf-8")
+            (unit_dir / SYSTEMD_TIMER).write_text(timer, encoding="utf-8")
+        except OSError as e:
+            systemd_err = f"写入单元文件失败: {e}"
+        else:
+            _run_quiet(["systemctl", "--user", "daemon-reload"])
+            code, out = _run_quiet([
+                "systemctl", "--user", "enable", "--now", SYSTEMD_TIMER,
+            ])
+            if code == 0:
+                msg = (f"systemd 定时器已启用 ✅ 每日 {time_hhmm}; {tz_note}; "
+                       "Persistent=true 错过自动补跑")
+                return True, msg
+            systemd_err = f"enable --now 失败: {out[:150]}"
+
+    # ---- 回退: crontab ----
+    if shutil.which("crontab"):
+        cmd = f"cd {SCRIPT_DIR} && {py} {script} run >> {LOG_DIR / 'cron.log'} 2>&1 {CRON_MARKER}"
+        code, out = _run_quiet(["crontab", "-l"])
+        lines = out.splitlines() if code == 0 else []
+        lines = [ln for ln in lines if CRON_MARKER not in ln]
+        lines.append(f"{int(mm)} {int(hh)} * * * {cmd}")
+        lines.append(f"@reboot {cmd}")
+        code2, out2 = _run_quiet(["crontab", "-"], input_text="\n".join(lines) + "\n")
+        if code2 == 0:
+            extra = f"; systemd 不可用({systemd_err})" if systemd_err else ""
+            msg = (f"crontab 已注册 ✅ 每日 {time_hhmm} + @reboot 补签; {tz_note}{extra}")
+            return True, msg
+        return False, (f"crontab 写入失败: {out2[:150]}"
+                       + (f"; systemd 也不可用({systemd_err})" if systemd_err else "; systemd 不可用"))
+
+    return False, ("系统无 systemd 用户会话也无 crontab,无法注册定时任务"
+                   + (f"({systemd_err})" if systemd_err else ""))
+
+
+def _remove_linux() -> tuple[bool, str]:
+    msgs = []
+    # systemd
+    _run_quiet(["systemctl", "--user", "disable", "--now", SYSTEMD_TIMER])
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    removed_unit = False
+    for f in (SYSTEMD_TIMER, SYSTEMD_SERVICE):
+        p = unit_dir / f
+        if p.exists():
+            p.unlink(missing_ok=True)
+            removed_unit = True
+    if removed_unit:
+        _run_quiet(["systemctl", "--user", "daemon-reload"])
+        msgs.append("systemd 定时器: 已移除")
+    # cron
+    if shutil.which("crontab"):
+        code, out = _run_quiet(["crontab", "-l"])
+        if code == 0 and any(CRON_MARKER in ln for ln in out.splitlines()):
+            kept = [ln for ln in out.splitlines() if CRON_MARKER not in ln]
+            _run_quiet(["crontab", "-"], input_text=("\n".join(kept) + "\n") if kept else "")
+            msgs.append("crontab 任务: 已移除")
+    if not msgs:
+        msgs.append("未发现已注册的任务")
+    return True, "; ".join(msgs)
+
+
+def _status_linux() -> dict:
+    out = {"daily": {"installed": False}, "logon": {"installed": False}}
+    if shutil.which("systemctl"):
+        code, _t = _run_quiet(["systemctl", "--user", "is-enabled", SYSTEMD_TIMER])
+        if code == 0:
+            out["daily"] = {"installed": True, "status": "systemd timer 已启用"}
+            _c, text = _run_quiet([
+                "systemctl", "--user", "list-timers", SYSTEMD_TIMER,
+                "--no-pager",
+            ])
+            # list-timers NEXT 列形如: Mon 2026-11-09 08:05:00 CST
+            m = re.search(r"^(\w{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?: \S+)?)", text, re.M)
+            if m:
+                out["daily"]["next_run"] = m.group(1)
+            out["logon"] = {"installed": True, "status": "Persistent=true,错过自动补跑"}
+            return out
+    if shutil.which("crontab"):
+        code, text = _run_quiet(["crontab", "-l"])
+        if code == 0 and any(CRON_MARKER in ln for ln in text.splitlines()):
+            out["daily"] = {"installed": True, "status": "crontab 已注册(每日 + @reboot)"}
+            out["logon"] = {"installed": True, "status": "@reboot 补签"}
+    return out
+
+
+# ---------------- 对外接口 ----------------
+def install_tasks(time_hhmm: str = "08:05") -> tuple[bool, str]:
+    """注册每日自动签到任务(Windows 计划任务 / Linux systemd+crontab)。"""
+    t = _norm_time(time_hhmm)
+    if not t:
+        return False, "时间格式应为 HH:MM,例如 08:05"
+    if IS_WINDOWS:
+        ok, msg = _install_windows(t)
+    else:
+        ok, msg = _install_linux(t)
+    log("计划任务注册 -> " + msg)
+    return ok, msg
+
+
+def remove_tasks() -> tuple[bool, str]:
+    if IS_WINDOWS:
+        ok, msg = _remove_windows()
+    else:
+        ok, msg = _remove_linux()
+    log("计划任务移除 -> " + msg)
+    return ok, msg
+
+
+def task_status() -> dict:
+    if IS_WINDOWS:
+        return _status_windows()
+    return _status_linux()
 
 
 # ----------------------------------------------------------------------------

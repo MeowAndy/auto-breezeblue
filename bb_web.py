@@ -1,25 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BreezeBlue 每日积分签到 —— 本地管理面板(多账号版)
-====================================================
-纯标准库实现(http.server),仅监听 127.0.0.1,不依赖 Flask。
+BreezeBlue 每日积分签到 —— 管理面板(多账号版,Windows / Linux 通用)
+====================================================================
+纯标准库实现(http.server),不依赖 Flask。
 
-  python bb_web.py   # 启动面板并自动打开浏览器(端口被占用时直接打开已运行的实例)
+  python bb_web.py                          # 默认 127.0.0.1:8765,自动打开浏览器
+  python bb_web.py --host 0.0.0.0 --port 8765 --token mysecret   # 服务器远程访问
+
+安全:
+  - 默认只监听 127.0.0.1
+  - --host 绑定非回环地址时必须带访问令牌(未提供则自动生成并打印),
+    页面通过 ?token=xxx 首次访问,之后浏览器记住令牌
 
 页面功能:
   - 多账号管理: 添加(Cookie / 邮箱密码)、编辑、启停、删除
   - 单账号 / 全部一键签到,余额与签到状态一览
-  - 注册/移除每日自动签到计划任务
+  - 注册/移除每日自动签到计划任务(Windows schtasks / Linux systemd+crontab)
   - 查看运行日志
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+import secrets
 import threading
 import time
+import urllib.parse
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +37,9 @@ import bb_checkin as core
 
 HOST = "127.0.0.1"
 PORT = 8765
+
+# 访问令牌(绑定非回环地址时启用;由 main() 设置)
+TOKEN = ""
 
 # 每账号会话探测缓存(key = 账号id+cookie指纹,避免刷新页面就打 API)
 _probe_lock = threading.Lock()
@@ -188,8 +200,28 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # 静默访问日志
         pass
 
+    def _authorized(self) -> bool:
+        """绑定非回环地址时的访问令牌校验。"""
+        if not TOKEN:
+            return True
+        if self.headers.get("X-Token") == TOKEN:
+            return True
+        q = urllib.parse.urlparse(self.path).query
+        return urllib.parse.parse_qs(q).get("token", [""])[0] == TOKEN
+
+    def _unauthorized(self):
+        body = b"401 Unauthorized: missing/invalid token (?token=xxx)"
+        self.send_response(401)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     # ---- GET ----
     def do_GET(self):
+        if not self._authorized():
+            self._unauthorized()
+            return
         path = self.path.split("?")[0]
         if path in ("/", "/index.html"):
             body = HTML.encode("utf-8")
@@ -214,6 +246,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- POST ----
     def do_POST(self):
+        if not self._authorized():
+            self._unauthorized()
+            return
         path = self.path.split("?")[0]
         data = self._body()
 
@@ -678,6 +713,11 @@ pre#log{background:#080e1c;border:1px solid var(--line);border-radius:11px;paddi
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let ACCOUNTS=[], EDIT_ID=null;
+/* 访问令牌: 首次从 URL ?token= 读取并记住,之后所有请求携带 X-Token 头 */
+const TOKEN=(()=>{const t=new URLSearchParams(location.search).get('token');
+  if(t){localStorage.setItem('bb_token',t);history.replaceState(null,'',location.pathname);}
+  return localStorage.getItem('bb_token')||'';})();
+function withTok(o){o=o||{};o.headers=Object.assign({},o.headers||{},{'X-Token':TOKEN});return o;}
 
 function toast(msg,bad=false,ms=4200){
   const t=$('toast');t.textContent=msg;t.className=bad?'bad show':'show';
@@ -688,7 +728,7 @@ function busy(btn,on,text){
   else{btn.disabled=false;if(btn._txt)btn.innerHTML=btn._txt;}
 }
 async function post(url,data){
-  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Token':TOKEN},body:JSON.stringify(data||{})});
   return r.json();
 }
 function fmtTime(iso){
@@ -760,8 +800,6 @@ function render(){
       '</div>';
     }).join('');
   }
-  // 总览
-  fetch('/api/state').then(r=>r.json()).then(()=>{}); // noop keepalive
 }
 function renderStats(st){
   $('n-accounts').textContent=st.totals.count;
@@ -774,7 +812,7 @@ function renderStats(st){
 }
 async function loadState(force){
   try{
-    const r=await fetch('/api/state'+(force?'?refresh=1':''));
+    const r=await fetch('/api/state'+(force?'?refresh=1':''),withTok());
     const j=await r.json();
     if(!j.ok){toast('读取状态失败: '+(j.error||''),true);return;}
     const st=j.state;
@@ -896,7 +934,7 @@ async function removeTask(){
 }
 async function loadLogs(){
   try{
-    const r=await fetch('/api/logs');const j=await r.json();
+    const r=await fetch('/api/logs',withTok());const j=await r.json();
     $('log').textContent=(j.lines&&j.lines.length)?j.lines.join('\n'):'(暂无日志)';
     const pre=$('log');pre.scrollTop=pre.scrollHeight;
   }catch(e){}
@@ -915,26 +953,51 @@ setInterval(()=>loadLogs(),60000);
 # 启动
 # ----------------------------------------------------------------------------
 def main() -> int:
+    global TOKEN
+
     try:
         import sys
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 
-    url = f"http://{HOST}:{PORT}/"
+    ap = argparse.ArgumentParser(description="BreezeBlue 签到管理面板")
+    ap.add_argument("--host", default=None,
+                    help="监听地址(默认 127.0.0.1;远程访问用 0.0.0.0)")
+    ap.add_argument("--port", type=int, default=None, help="监听端口(默认 8765)")
+    ap.add_argument("--token", default=None,
+                    help="访问令牌;绑定非回环地址时必带(未提供则自动生成)")
+    args = ap.parse_args()
+
+    host = args.host or HOST
+    port = args.port or PORT
+    TOKEN = args.token or ""
+
+    # 非回环地址: 强制令牌(未提供则自动生成)
+    non_loopback = host not in ("127.0.0.1", "localhost", "::1")
+    if non_loopback and not TOKEN:
+        TOKEN = secrets.token_hex(4)
+
+    url = f"http://{host}:{port}/"
+    open_url = url + (f"?token={TOKEN}" if TOKEN else "")
+
     try:
-        server = ThreadingHTTPServer((HOST, PORT), Handler)
+        server = ThreadingHTTPServer((host, port), Handler)
     except OSError:
-        print(f"端口 {PORT} 已被占用,直接打开已运行的面板…")
-        webbrowser.open(url)
+        print(f"端口 {port} 已被占用,直接打开已运行的面板…")
+        webbrowser.open(open_url)
         return 0
 
     core.LOG_DIR.mkdir(parents=True, exist_ok=True)
-    core.log(f"管理面板启动: {url}")
-
-    threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    core.log(f"管理面板启动: {url}" + (f"(访问令牌: {TOKEN})" if TOKEN else "(本机模式)"))
 
     print(f"BreezeBlue 签到面板运行中: {url}  (Ctrl+C 退出)")
+    if TOKEN:
+        print(f"  访问令牌: {TOKEN}")
+        print(f"  请用 {open_url} 首次访问(浏览器会记住令牌)")
+
+    threading.Timer(0.6, lambda: webbrowser.open(open_url)).start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
