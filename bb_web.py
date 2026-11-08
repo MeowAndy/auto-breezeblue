@@ -277,22 +277,31 @@ class Handler(BaseHTTPRequestHandler):
     def _account_add(self, data: dict):
         import re
         name = str(data.get("name", "")).strip()
+        cookie_text = str(data.get("cookie", "")).strip()   # 方式一:Cookie 凭证区域
+        email = str(data.get("email", "")).strip()          # 方式二:邮箱 + 密码区域
         password = str(data.get("password", ""))
-        # 原始凭据:Cookie串 / cURL / 邮箱(兼容 email 字段直接传邮箱)
-        cred = str(data.get("cookie", "")).strip() or str(data.get("email", "")).strip()
 
-        # ---- 智能识别:纯邮箱 -> 走密码登录;否则当 Cookie/cURL 解析 ----
-        if cred.strip() and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", cred.strip()):
-            email = cred.strip()
+        if cookie_text and (email or password):
+            self._json({"ok": False, "message": "两种方式只能二选一:请只填写 Cookie 或只填写邮箱密码"})
+            return
+
+        me: dict = {}
+
+        # 方式二:邮箱 + 密码 -> 真实登录一次,成功才保存
+        if email:
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                self._json({"ok": False, "message": "邮箱格式不正确"})
+                return
             if not password:
-                self._json({"ok": False, "message": "识别为邮箱登录,请填写密码"})
+                self._json({"ok": False, "message": "请填写密码"})
                 return
             ok, cookie, info = core.login_password(email, password)
             if not ok:
                 self._json({"ok": False, "message": "邮箱密码登录失败,请检查后重试(未保存任何内容)",
                             "detail": core._brief(info, 400)})
                 return
-            me = info if isinstance(info, dict) else {}
+            if isinstance(info, dict):
+                me = info
             if not name and me:
                 name = me.get("display_name") or core._mask_email(me.get("email", ""))
             acct = core.add_account(cookie=cookie, email=email, password=password, name=name)
@@ -303,18 +312,19 @@ class Handler(BaseHTTPRequestHandler):
                         "id": acct["id"]})
             return
 
+        # 方式一:Cookie 凭证 -> 立即校验,成功才保存
+        if not cookie_text:
+            self._json({"ok": False, "message": "请在「方式一」粘贴 Cookie,或在「方式二」填写邮箱密码"})
+            return
+        if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", cookie_text):
+            self._json({"ok": False, "message": "这看起来是一个邮箱:请填到「方式二:邮箱 + 密码」区域"})
+            return
         try:
-            cookie = core.extract_cookie(cred) if cred.strip() else ""
+            cookie = core.extract_cookie(cookie_text)
         except ValueError as e:
             self._json({"ok": False, "message": str(e)})
             return
 
-        if not cookie:
-            self._json({"ok": False, "message": "无法识别的凭据:请粘贴 Cookie/cURL,或输入邮箱+密码"})
-            return
-
-        # Cookie 方式: 先验证,成功才保存
-        me: dict = {}
         ok, info = core.check_session(cookie)
         if not ok:
             self._json({"ok": False, "message": "Cookie 无效或已过期,请重新抓取(未保存任何内容)",
@@ -348,25 +358,34 @@ class Handler(BaseHTTPRequestHandler):
         if "enabled" in data:
             updates["enabled"] = bool(data.get("enabled"))
 
-        cred = str(data.get("cookie", "")).strip()
+        cookie_text = str(data.get("cookie", "")).strip()   # 方式一区域:更换 Cookie
+        email = str(data.get("email", "")).strip()          # 方式二区域:邮箱 + 密码重登
         password = str(data.get("password", ""))
 
-        # 凭据为邮箱 -> 更新邮箱/密码并真实登录一次,成功才保存(同时刷新会话)
-        if cred and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", cred):
+        if cookie_text and email:
+            self._json({"ok": False, "message": "两种方式只能二选一:Cookie 和邮箱密码只填一处"})
+            return
+        if cookie_text and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", cookie_text):
+            self._json({"ok": False, "message": "这看起来是一个邮箱:请填到「方式二:邮箱 + 密码」区域"})
+            return
+
+        # 方式二:邮箱 + 密码都填 -> 真实登录一次,成功才保存(同时刷新会话)
+        if email:
             if not password:
-                self._json({"ok": False, "message": "识别为邮箱登录,请填写密码"})
+                self._json({"ok": False, "message": "方式二:请填写密码(登录验证用)"})
                 return
-            ok, cookie, info = core.login_password(cred, password)
+            ok, cookie, info = core.login_password(email, password)
             if not ok:
                 self._json({"ok": False, "message": "邮箱密码登录失败,未保存任何修改",
                             "detail": core._brief(info, 400)})
                 return
-            updates.update(email=cred, password=password, cookie=cookie)
+            updates.update(email=email, password=password, cookie=cookie)
             msgs.append("已用邮箱密码重新登录,会话已刷新")
 
-        elif cred:
+        # 方式一:更换 Cookie(验证通过才保存)
+        elif cookie_text:
             try:
-                cookie = core.extract_cookie(cred)
+                cookie = core.extract_cookie(cookie_text)
             except ValueError as e:
                 self._json({"ok": False, "message": str(e)})
                 return
@@ -378,6 +397,7 @@ class Handler(BaseHTTPRequestHandler):
             updates["cookie"] = cookie
             msgs.append("Cookie 已更新")
 
+        # 仅改密码(不登录,下次 Cookie 失效时用于重登)
         if password and not updates.get("password"):
             updates["password"] = password
             msgs.append("密码已更新")
@@ -387,7 +407,7 @@ class Handler(BaseHTTPRequestHandler):
             msgs.append("已清除邮箱密码")
 
         if not updates:
-            self._json({"ok": False, "message": "没有需要修改的内容"})
+            self._json({"ok": False, "message": "没有需要修改的内容(留空表示保持不变)"})
             return
 
         core.update_account(acct["id"], **updates)
@@ -521,9 +541,13 @@ textarea{resize:vertical;min-height:88px;font-family:Consolas,monospace;font-siz
 label{display:block;font-size:12.5px;color:var(--sub);margin:12px 0 6px}
 .checkline{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--sub);margin-top:12px}
 .checkline input{width:auto}
-.detect{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--sub);
-  background:#0b1322;border:1px dashed var(--line);border-radius:9px;padding:7px 11px;margin-top:8px}
-.detect b{color:#7cc0ff}
+.mode{border:1px solid var(--line);border-radius:13px;padding:14px;margin-top:16px;background:#0c1424}
+.mode-head{font-size:13.5px;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.mode-head .no{width:21px;height:21px;border-radius:50%;background:#16233f;border:1px solid var(--line2);
+  display:inline-flex;align-items:center;justify-content:center;font-size:11.5px;color:#7cc0ff;flex:none}
+.mode-head .tag{font-size:10.5px;font-weight:600;color:var(--sub);border:1px solid var(--line);
+  border-radius:999px;padding:2px 8px;background:#0b1322}
+.row2{display:flex;gap:12px;flex-wrap:wrap}
 
 /* ---------- 弹窗 ---------- */
 .mask{position:fixed;inset:0;background:#04070fd9;backdrop-filter:blur(3px);
@@ -533,11 +557,6 @@ label{display:block;font-size:12.5px;color:var(--sub);margin:12px 0 6px}
   border-radius:18px;max-width:560px;width:100%;padding:24px}
 .modal h3{font-size:16px;margin-bottom:6px}
 .modal .msub{color:var(--sub);font-size:12.5px;line-height:1.7}
-.checkline{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--sub);margin-top:12px}
-.checkline input{width:auto}
-.detect{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--sub);
-  background:#0b1322;border:1px dashed var(--line);border-radius:9px;padding:7px 11px;margin-top:8px}
-.detect b{color:#7cc0ff}
 .modal-btns{display:flex;gap:10px;justify-content:flex-end;margin-top:20px}
 
 pre#log{background:#080e1c;border:1px solid var(--line);border-radius:11px;padding:13px;
@@ -610,28 +629,42 @@ pre#log{background:#080e1c;border:1px solid var(--line);border-radius:11px;paddi
 <div class="mask" id="mask">
   <div class="modal">
     <h3 id="m-title">添加账号</h3>
-    <div class="msub" id="m-sub">粘贴后自动识别登录方式;<b style="color:var(--txt)">点「验证并保存」时才真正校验/登录,成功才会保存</b>。</div>
+    <div class="msub" id="m-sub">两种方式<b style="color:var(--txt)">二选一</b>;点「验证并保存」时才真正校验/登录,成功才会保存。</div>
 
     <label for="m-name">显示名(可选,留空自动取站点昵称)</label>
     <input id="m-name" placeholder="例如: 大号 / 小号">
 
-    <label for="m-cred">凭据:粘贴 <b style="color:var(--txt)">Cookie 请求头</b> / <b style="color:var(--txt)">Copy as cURL</b>,或直接输入<b style="color:var(--txt)">邮箱</b></label>
-    <textarea id="m-cred" placeholder="breeze_blue_session=xxxx; breeze_locale=zh&#10;—— 或 ——&#10;name@example.com"></textarea>
-    <div class="detect" id="m-detect"><span class="dot y"></span>待输入</div>
-
-    <label for="m-pwd" id="m-pwd-label">密码(凭据为邮箱时必填)</label>
-    <input id="m-pwd" type="password" placeholder="BreezeBlue 密码(编辑时留空=不修改)">
-
-    <div class="hint" id="m-hint">
-      <b>Cookie 抓取:</b>浏览器登录 <code>breezeblue.ai</code> → <code>F12</code> →
-      <b>Network/网络</b> → <code>F5</code> 刷新 → 点任意一条请求 →
-      <b>Request Headers/请求标头</b> 里复制 <code>Cookie:</code> 后面的全部内容。
-      <b id="hint-edit" style="display:none">编辑模式:凭据留空 = 不修改。</b><br>
-      <b>邮箱密码:</b>保存时会真实登录一次换取会话;密码只存本机,
-      用于 Cookie 过期时自动重登。⚠️ 纯 Google 注册的账号可能没有密码,请用 Cookie 方式。
+    <div class="mode">
+      <div class="mode-head"><span class="no">1</span>Cookie 凭证<span class="tag">推荐 · 所有账号通用</span></div>
+      <label for="m-cookie" style="margin-top:0">粘贴浏览器里的 <b style="color:var(--txt)">Cookie 请求头</b>(整行)或 <b style="color:var(--txt)">Copy as cURL</b> 全文</label>
+      <textarea id="m-cookie" placeholder="breeze_blue_session=xxxx; breeze_locale=zh"></textarea>
+      <div class="hint" style="margin-top:8px">
+        <b>抓取步骤:</b>浏览器登录 <code>breezeblue.ai</code> → <code>F12</code> →
+        <b>Network/网络</b> → <code>F5</code> 刷新 → 点任意一条请求 →
+        <b>Request Headers/请求标头</b> 里复制 <code>Cookie:</code> 后面的全部内容。
+        <b id="hint-edit" style="display:none">编辑模式:留空 = 不修改 Cookie。</b>
+      </div>
     </div>
-    <div class="checkline" id="clear-pwd-line" style="display:none">
-      <input type="checkbox" id="m-clearpwd"> 清除已保存的邮箱密码
+
+    <div class="mode">
+      <div class="mode-head"><span class="no">2</span>邮箱 + 密码<span class="tag">仅邮箱注册账号</span></div>
+      <div class="row2">
+        <div style="flex:1;min-width:0">
+          <label for="m-email" style="margin-top:0">邮箱</label>
+          <input id="m-email" type="email" placeholder="name@example.com">
+        </div>
+        <div style="flex:1;min-width:0">
+          <label for="m-pwd" style="margin-top:0">密码</label>
+          <input id="m-pwd" type="password" placeholder="BreezeBlue 密码(编辑时留空=不修改)">
+        </div>
+      </div>
+      <div class="hint" style="margin-top:8px">
+        保存时会<b>真实登录一次</b>换取会话;密码只存本机,用于 Cookie 过期时自动重登。
+        ⚠️ 纯 Google 注册的账号可能没有密码,请用方式一。
+      </div>
+      <div class="checkline" id="clear-pwd-line" style="display:none">
+        <input type="checkbox" id="m-clearpwd"> 清除已保存的邮箱密码
+      </div>
     </div>
 
     <div class="modal-btns">
@@ -784,52 +817,26 @@ async function delOne(id){
   toast(j.message,!j.ok);loadState();
 }
 
-/* ================= 弹窗(智能识别 Cookie / 邮箱密码) ================= */
-/* EDIT_ID 已在顶部与 ACCOUNTS 一并声明 */
-function detectMode(text){
-  const t=(text||'').trim();
-  if(!t) return null;
-  if(/cookie\s*:/i.test(t)) return 'cookie';
-  if(/-H\s+['"`]/i.test(t) && /cookie/i.test(t)) return 'cookie';   // copy as cURL
-  if(/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t)) return 'pwd';            // 纯邮箱
-  if(/=/.test(t) && !/\s/.test(t)) return 'cookie';                 // 单个键值对
-  if(/[\w.-]+=[^;]*;/.test(t)) return 'cookie';                     // 多个键值对
-  return null;
-}
-function onCredInput(){
-  const mode=detectMode($('m-cred').value);
-  const d=$('m-detect');
-  if(mode==='cookie'){
-    d.innerHTML='<span class="dot b"></span>识别为 <b>Cookie</b> 模式:保存时立即校验有效性(密码框可留空)';
-  }else if(mode==='pwd'){
-    d.innerHTML='<span class="dot b"></span>识别为 <b>邮箱密码</b> 模式:保存时真实登录一次,成功才保存';
-  }else{
-    d.innerHTML='<span class="dot y"></span>待输入(粘贴 Cookie/cURL 或输入邮箱)';
-  }
-}
+/* ================= 弹窗(两个独立区域:Cookie 凭证 / 邮箱密码) ================= */
 function openAdd(){
   EDIT_ID=null;
   $('m-title').textContent='添加账号';
-  $('m-sub').innerHTML='粘贴后自动识别登录方式;<b style="color:var(--txt)">点「验证并保存」时才真正校验/登录,成功才会保存</b>。';
-  $('m-name').value='';$('m-cred').value='';$('m-pwd').value='';
-  $('m-pwd').disabled=false;
+  $('m-sub').innerHTML='两种方式<b style="color:var(--txt)">二选一</b>;点「验证并保存」时才真正校验/登录,成功才会保存。';
+  $('m-name').value='';$('m-cookie').value='';$('m-email').value='';$('m-pwd').value='';
   $('clear-pwd-line').style.display='none';$('m-clearpwd').checked=false;
   $('hint-edit').style.display='none';
-  onCredInput();
   $('mask').classList.add('show');
-  setTimeout(()=>$('m-cred').focus(),50);
+  setTimeout(()=>$('m-cookie').focus(),50);
 }
 function openEdit(id){
   const a=ACCOUNTS.find(x=>x.id===id);if(!a)return;
   EDIT_ID=id;
   $('m-title').textContent='编辑账号 · '+a.name;
-  $('m-sub').innerHTML='留空的字段表示保持不变;可更换凭据、改显示名或启停。';
-  $('m-name').value=a.name;$('m-cred').value='';$('m-pwd').value='';
-  $('m-pwd').disabled=false;
+  $('m-sub').innerHTML='所有输入<b style="color:var(--txt)">留空 = 保持不变</b>;可更换 Cookie、改邮箱密码或启停。';
+  $('m-name').value=a.name;$('m-cookie').value='';$('m-email').value='';$('m-pwd').value='';
   $('clear-pwd-line').style.display=a.pwd_set?'flex':'none';
   $('m-clearpwd').checked=false;
   $('hint-edit').style.display='inline';
-  onCredInput();
   $('mask').classList.add('show');
 }
 function closeModal(){$('mask').classList.remove('show');}
@@ -837,10 +844,16 @@ $('mask').addEventListener('click',e=>{if(e.target===$('mask'))closeModal();});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});
 
 async function saveModal(){
-  const cred=$('m-cred').value.trim();
-  const mode=detectMode(cred);
-  if(!EDIT_ID && !cred){toast('请先粘贴 Cookie 或输入邮箱',true);return;}
-  if(!EDIT_ID && mode==='pwd' && !$('m-pwd').value){toast('识别为邮箱登录,请填写密码',true);return;}
+  const cookieText=$('m-cookie').value.trim();
+  const email=$('m-email').value.trim();
+  const password=$('m-pwd').value;
+
+  if(!EDIT_ID){
+    if(!cookieText && !email && !password){toast('请在「方式一」粘贴 Cookie,或在「方式二」填写邮箱密码',true);return;}
+    if(cookieText && (email||password)){toast('两种方式只能二选一:请清空其中一个区域',true);return;}
+    if(email && !password){toast('方式二:请填写密码',true);return;}
+    if(!email && password){toast('方式二:请填写邮箱',true);return;}
+  }
   const b=$('m-save');busy(b,true,'验证中…');
   try{
     let j;
@@ -848,15 +861,17 @@ async function saveModal(){
       j=await post('/api/account/update',{
         id:EDIT_ID,
         name:$('m-name').value,
-        cookie:cred,                 // 留空=不修改;服务端只对非空做校验
-        password:$('m-pwd').value,
+        cookie:cookieText,           // 留空=不修改
+        email:email,                 // 邮箱+密码都填 -> 真实登录一次并刷新会话
+        password:password,           // 单独填 -> 仅更新密码
         clear_password:$('m-clearpwd').checked
       });
     }else{
       j=await post('/api/account',{
         name:$('m-name').value,
-        cookie:cred,                 // 服务端自动识别:邮箱 -> 密码登录,Cookie串 -> 校验
-        password:$('m-pwd').value
+        cookie:cookieText,           // 方式一:Cookie 凭证
+        email:email,                 // 方式二:邮箱 + 密码
+        password:password
       });
     }
     toast(j.message+(j.detail?' · '+String(j.detail).slice(0,120):''),!j.ok,6500);
@@ -888,7 +903,6 @@ async function loadLogs(){
 }
 
 loadState();loadLogs();
-$('m-cred').addEventListener('input', onCredInput);
 setInterval(()=>loadState(),60000);
 setInterval(()=>loadLogs(),60000);
 </script>
