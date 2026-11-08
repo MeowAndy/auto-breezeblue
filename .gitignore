@@ -2,6 +2,7 @@
 config.json
 logs/
 *.log
+watch.pid
 
 # Python
 __pycache__/

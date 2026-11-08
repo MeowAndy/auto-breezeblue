@@ -769,8 +769,8 @@ def tz_note() -> str:
 
 
 def _remove_linux() -> tuple[bool, str]:
-    msgs = [_stop_watch()]
-    # systemd 用户级
+    msgs = []
+    # systemd 用户级(watch 进程由 remove_tasks 统一停止)
     _run_quiet(["systemctl", "--user", "disable", "--now", SYSTEMD_TIMER])
     unit_dir = Path.home() / ".config" / "systemd" / "user"
     removed_unit = False
@@ -967,6 +967,9 @@ def remove_tasks() -> tuple[bool, str]:
         ok, msg = _remove_windows()
     else:
         ok, msg = _remove_linux()
+    stop_msg = _stop_watch()
+    if "未在运行" not in stop_msg:
+        msg += "; " + stop_msg
     log("计划任务移除 -> " + msg)
     return ok, msg
 
