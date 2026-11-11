@@ -39,11 +39,14 @@ import json
 import os
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import threading
 import time
 import uuid
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -77,9 +80,50 @@ UA = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-# 可重入锁: load_config(迁移) -> save_config、update_account -> save_config
-# 存在同线程嵌套获取,必须用 RLock,否则自死锁
+# 线程可重入锁 + 下方文件锁保护跨进程读-改-写。
+# load_config(迁移) / update_account 会嵌套 save_config,不能重复锁定文件。
 _CONFIG_LOCK = threading.RLock()
+_CONFIG_LOCK_STATE = threading.local()
+
+
+@contextmanager
+def _config_transaction():
+    """跨线程/进程保护整个读-改-写事务;锁独立文件以兼容原子替换。"""
+    with _CONFIG_LOCK:
+        if getattr(_CONFIG_LOCK_STATE, "active", False):
+            yield
+            return
+        lock_path = CONFIG_PATH.with_name(CONFIG_PATH.name + ".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(fd, "r+b") as lock_file:
+            if IS_WINDOWS:
+                import errno
+                import msvcrt
+                if os.fstat(lock_file.fileno()).st_size == 0:
+                    lock_file.write(b"\0")
+                    lock_file.flush()
+                while True:
+                    lock_file.seek(0)
+                    try:
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as exc:
+                        if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                            raise
+                        time.sleep(0.05)
+            else:
+                import fcntl
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            _CONFIG_LOCK_STATE.active = True
+            try:
+                yield
+            finally:
+                _CONFIG_LOCK_STATE.active = False
+                if IS_WINDOWS:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 # ----------------------------------------------------------------------------
@@ -130,12 +174,21 @@ def new_account(**kw) -> dict:
 
 
 def load_config() -> dict:
+    with _config_transaction():
+        return _load_config_unlocked()
+
+
+def _load_config_unlocked() -> dict:
     cfg = {}
     if CONFIG_PATH.exists():
         try:
             cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
-            log("警告: config.json 解析失败,已忽略并重建")
+            raise ValueError("config.json 读取或解析失败,原文件未修改") from None
+    if not isinstance(cfg, dict):
+        raise ValueError("config.json 格式错误,原文件未修改")
+    if cfg.get("version") == 2 and not isinstance(cfg.get("accounts", []), list):
+        raise ValueError("config.json 账号列表格式错误,原文件未修改")
 
     # v1(单账号) -> v2(账号列表)自动迁移,保留老 Cookie
     if cfg.get("version") != 2:
@@ -169,10 +222,18 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    with _CONFIG_LOCK:
-        CONFIG_PATH.write_text(
-            json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+    with _config_transaction():
+        # 同目录临时文件 + replace,读者不会读到被截断/半写入的 JSON。
+        fd, temp_name = tempfile.mkstemp(prefix=CONFIG_PATH.name + ".",
+                                         suffix=".tmp", dir=CONFIG_PATH.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(cfg, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_name, CONFIG_PATH)
+        finally:
+            Path(temp_name).unlink(missing_ok=True)
 
 
 def get_accounts() -> list[dict]:
@@ -187,7 +248,7 @@ def find_account(acct_id: str) -> dict | None:
 
 
 def update_account(acct_id: str, **kwargs) -> dict | None:
-    with _CONFIG_LOCK:
+    with _config_transaction():
         cfg = load_config()
         for a in cfg["accounts"]:
             if a.get("id") == acct_id:
@@ -198,7 +259,7 @@ def update_account(acct_id: str, **kwargs) -> dict | None:
 
 
 def remove_account(acct_id: str) -> bool:
-    with _CONFIG_LOCK:
+    with _config_transaction():
         cfg = load_config()
         before = len(cfg["accounts"])
         cfg["accounts"] = [a for a in cfg["accounts"] if a.get("id") != acct_id]
@@ -212,7 +273,7 @@ def add_account(cookie: str = "", email: str = "", password: str = "",
                 name: str = "", enabled: bool = True) -> dict:
     acct = new_account(cookie=cookie, email=email, password=password,
                        name=name, enabled=enabled)
-    with _CONFIG_LOCK:
+    with _config_transaction():
         cfg = load_config()
         cfg["accounts"].append(acct)
         save_config(cfg)
@@ -496,8 +557,19 @@ def run_checkin_all() -> dict:
 
     results = []
     for acct in accounts:
-        results.append({"id": acct.get("id"), "name": display_name(acct),
-                        **run_checkin_account(acct)})
+        try:
+            result = run_checkin_account(acct)
+        except Exception as exc:  # 一个账号的网络/解析/存储异常不能中断其余账号
+            # 异常原文可能包含请求头、Cookie 或密码,仅暴露异常类型。
+            result = {"ok": False, "kind": "error",
+                      "message": "签到发生异常,请检查网络或账号配置",
+                      "detail": type(exc).__name__}
+            log(f"[{display_name(acct)}] {result['message']} ({result['detail']})")
+            try:
+                update_account(acct.get("id"), last_result={**result, "at": _now()})
+            except Exception as save_exc:
+                log("保存失败账号结果异常 (" + type(save_exc).__name__ + ")")
+        results.append({"id": acct.get("id"), "name": display_name(acct), **result})
     ok_count = sum(1 for r in results if r.get("ok"))
     summary = {
         "ok": ok_count == len(results) and bool(results),
@@ -696,17 +768,40 @@ WantedBy=timers.target
                    "若是 Docker 容器,可手动运行: python3 bb_checkin.py watch")
 
 
-def _install_crontab(hh: str, mm: str, py: str, script: Path) -> tuple[bool, str]:
-    cmd = f"cd {SCRIPT_DIR} && {py} {script} run >> {LOG_DIR / 'cron.log'} 2>&1 {CRON_MARKER}"
+def _read_crontab() -> tuple[bool, list[str], str]:
     code, out = _run_quiet(["crontab", "-l"])
-    lines = out.splitlines() if code == 0 else []
-    lines = [ln for ln in lines if CRON_MARKER not in ln]
+    if code == 0:
+        return True, out.splitlines(), ""
+    # 只有明确的“尚未创建 crontab”才等价于空表;权限/执行失败不可覆盖。
+    if code == 1 and re.fullmatch(r"no crontab for [^\r\n]+", out.strip(), re.I):
+        return True, [], ""
+    return False, [], f"读取 crontab 失败(退出码 {code})"
+
+
+def _install_crontab(hh: str, mm: str, py: str, script: Path) -> tuple[bool, str]:
+    ok, previous, error = _read_crontab()
+    if not ok:
+        return False, error
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False, "创建 cron 日志目录失败"
+    # shell 引号保护路径中的空格;crontab 即使在引号内也会解释 %。
+    quote = lambda value: shlex.quote(str(value)).replace("%", r"\%")
+    cmd = (f"cd {quote(SCRIPT_DIR)} && {quote(py)} {quote(script)} run "
+           f">> {quote(LOG_DIR / 'cron.log')} 2>&1 {CRON_MARKER}")
+    lines = [ln for ln in previous if CRON_MARKER not in ln]
     lines.append(f"{int(mm)} {int(hh)} * * * {cmd}")
     lines.append(f"@reboot {cmd}")
-    code2, out2 = _run_quiet(["crontab", "-"], input_text="\n".join(lines) + "\n")
-    if code2 == 0:
-        return True, f"crontab 已注册 ✅ 每日 {hh}:{mm} + @reboot 补签"
-    return False, f"写入失败 {out2[:150]}"
+    code, _out = _run_quiet(["crontab", "-"], input_text="\n".join(lines) + "\n")
+    if code != 0:
+        return False, f"写入 crontab 失败(退出码 {code})"
+    ok, actual, error = _read_crontab()
+    if not ok:
+        return False, "crontab 写入后验证失败: " + error
+    if actual != lines:
+        return False, "crontab 写入后读回不一致,请检查计划任务"
+    return True, f"crontab 已注册 ✅ 每日 {hh}:{mm} + @reboot 补签"
 
 
 def _install_system_timer(time_hhmm: str, py: str, script: Path) -> tuple[bool, str]:
@@ -770,6 +865,7 @@ def tz_note() -> str:
 
 def _remove_linux() -> tuple[bool, str]:
     msgs = []
+    ok = True
     # systemd 用户级(watch 进程由 remove_tasks 统一停止)
     _run_quiet(["systemctl", "--user", "disable", "--now", SYSTEMD_TIMER])
     unit_dir = Path.home() / ".config" / "systemd" / "user"
@@ -792,14 +888,28 @@ def _remove_linux() -> tuple[bool, str]:
         msgs.append("systemd 系统定时器: 已移除")
     # cron
     if shutil.which("crontab"):
-        code, out = _run_quiet(["crontab", "-l"])
-        if code == 0 and any(CRON_MARKER in ln for ln in out.splitlines()):
-            kept = [ln for ln in out.splitlines() if CRON_MARKER not in ln]
-            _run_quiet(["crontab", "-"], input_text=("\n".join(kept) + "\n") if kept else "")
-            msgs.append("crontab 任务: 已移除")
-    if len(msgs) == 1:
-        msgs.append("未发现其他已注册的任务")
-    return True, "; ".join(msgs)
+        read_ok, lines, error = _read_crontab()
+        if not read_ok:
+            ok = False
+            msgs.append(error)
+        elif any(CRON_MARKER in ln for ln in lines):
+            kept = [ln for ln in lines if CRON_MARKER not in ln]
+            code, _out = _run_quiet(
+                ["crontab", "-"], input_text=("\n".join(kept) + "\n") if kept else "")
+            if code != 0:
+                ok = False
+                msgs.append(f"crontab 移除失败(退出码 {code})")
+            else:
+                read_ok, actual, error = _read_crontab()
+                # 一些 cron 实现在空表上返回一行空白。
+                if not read_ok or [ln for ln in actual if ln] != [ln for ln in kept if ln]:
+                    ok = False
+                    msgs.append("crontab 移除后验证失败" + (": " + error if error else ",读回不一致"))
+                else:
+                    msgs.append("crontab 任务: 已移除")
+    if not msgs:
+        msgs.append("未发现已注册的任务")
+    return ok, "; ".join(msgs)
 
 
 def _status_linux() -> dict:
@@ -932,10 +1042,9 @@ def cmd_watch() -> int:
     try:
         while True:
             try:
-                for acct in [a for a in get_accounts() if a.get("enabled", True)]:
-                    run_checkin_account(acct)
+                run_checkin_all()
             except Exception as e:  # noqa: BLE001
-                log(f"watch 轮次异常: {e!r}")
+                log("watch 轮次异常 (" + type(e).__name__ + ")")
             sleep_s = _watch_next_sleep()
             log(f"watch 下次检查: {int(sleep_s)}s 后")
             deadline = time.time() + sleep_s
