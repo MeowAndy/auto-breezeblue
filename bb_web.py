@@ -25,7 +25,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import ipaddress
 import secrets
+from http.cookies import CookieError, SimpleCookie
 import threading
 import time
 import urllib.parse
@@ -40,6 +42,25 @@ PORT = 8765
 
 # 访问令牌(绑定非回环地址时启用;由 main() 设置)
 TOKEN = ""
+TRUST_PROXY = False
+_CSRF_SECRET = secrets.token_bytes(32)
+_CSRF_COOKIE = "bb_csrf"
+_task_lock = threading.Lock()
+
+
+def _valid_csrf(value: str) -> bool:
+    import hmac
+    token, sep, signature = value.partition(".")
+    if not sep or len(token) != 64:
+        return False
+    expected = hmac.new(_CSRF_SECRET, token.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def _new_csrf() -> str:
+    import hmac
+    token = secrets.token_hex(32)
+    return token + "." + hmac.new(_CSRF_SECRET, token.encode(), hashlib.sha256).hexdigest()
 
 # 每账号会话探测缓存(key = 账号id+cookie指纹,避免刷新页面就打 API)
 _probe_lock = threading.Lock()
@@ -188,14 +209,63 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _body(self) -> dict:
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
-            return {}
-        raw = self.rfile.read(length)
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            raise ValueError("写操作必须使用 application/json")
+        if self.headers.get("Transfer-Encoding"):
+            raise ValueError("不支持分块请求")
         try:
-            return json.loads(raw.decode("utf-8"))
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ValueError("请求长度无效") from None
+        if not 0 < length <= 1024 * 1024:
+            raise ValueError("请求必须为非空 JSON 且不超过 1 MiB")
+        try:
+            data = json.loads(self.rfile.read(length).decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
-            return {}
+            raise ValueError("JSON 格式无效") from None
+        if not isinstance(data, dict):
+            raise ValueError("JSON 必须是对象")
+        return data
+
+    def _trusted_proxy(self) -> bool:
+        try:
+            return TRUST_PROXY and ipaddress.ip_address(self.client_address[0]).is_loopback
+        except ValueError:
+            return False
+
+    def _write_allowed(self) -> bool:
+        import hmac
+        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            try:
+                parsed = urllib.parse.urlsplit(origin)
+            except ValueError:
+                return False
+            scheme = "http"
+            if self._trusted_proxy():
+                scheme = self.headers.get("X-Forwarded-Proto", "http")
+            if (parsed.scheme != scheme or parsed.netloc.lower() != self.headers.get("Host", "").lower()
+                    or parsed.path or parsed.query or parsed.fragment or parsed.username):
+                return False
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+            value = cookie[_CSRF_COOKIE].value
+        except (CookieError, KeyError, ValueError):
+            return False
+        return _valid_csrf(value) and hmac.compare_digest(value, self.headers.get("X-CSRF-Token", ""))
+
+    def _audit_task(self, action: str, ok: bool):
+        peer = self.client_address[0]
+        if self._trusted_proxy():
+            forwarded = self.headers.get("X-Real-IP", "")
+            try:
+                peer = str(ipaddress.ip_address(forwarded))
+            except ValueError:
+                pass
+        core.log(f"面板定时操作: action={action} ok={ok} client={peer}")
 
     def log_message(self, *args):  # 静默访问日志
         pass
@@ -224,11 +294,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = self.path.split("?")[0]
         if path in ("/", "/index.html"):
-            body = HTML.encode("utf-8")
+            csrf = _new_csrf()
+            body = HTML.replace("__BB_CSRF_TOKEN__", csrf).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            secure = "; Secure" if self._trusted_proxy() and self.headers.get("X-Forwarded-Proto") == "https" else ""
+            self.send_header("Set-Cookie", f"{_CSRF_COOKIE}={csrf}; Path=/; HttpOnly; SameSite=Strict{secure}")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
             self.end_headers()
             self.wfile.write(body)
             return
@@ -250,7 +325,14 @@ class Handler(BaseHTTPRequestHandler):
             self._unauthorized()
             return
         path = self.path.split("?")[0]
-        data = self._body()
+        if not self._write_allowed():
+            self._json({"ok": False, "message": "页面校验失败,请刷新面板后重试"}, 403)
+            return
+        try:
+            data = self._body()
+        except ValueError as exc:
+            self._json({"ok": False, "message": str(exc)}, 400)
+            return
 
         if path == "/api/account":
             return self._account_add(data)
@@ -298,13 +380,27 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 _checkin_lock.release()
             return
-        if path == "/api/task":
-            ok, msg = core.install_tasks(str(data.get("time", "08:05")).strip())
-            self._json({"ok": ok, "message": msg})
-            return
-        if path == "/api/task/remove":
-            ok, msg = core.remove_tasks()
-            self._json({"ok": ok, "message": msg})
+        if path in ("/api/task", "/api/task/remove"):
+            removing = path.endswith("/remove")
+            if removing and data.get("confirm") != "stop-schedule":
+                self._json({"ok": False, "message": "停止自动签到需要明确确认"}, 400)
+                return
+            if not _task_lock.acquire(blocking=False):
+                self._json({"ok": False, "message": "定时任务操作正在进行,请稍候"}, 409)
+                return
+            action = "remove" if removing else "install"
+            try:
+                if removing:
+                    ok, msg = core.remove_tasks()
+                else:
+                    ok, msg = core.install_tasks(str(data.get("time", "08:05")).strip())
+                self._audit_task(action, ok)
+                self._json({"ok": ok, "message": msg})
+            except Exception:  # noqa: BLE001
+                self._audit_task(action, False)
+                self._json({"ok": False, "message": "定时操作异常,请检查日志及任务实际状态"}, 500)
+            finally:
+                _task_lock.release()
             return
         self._json({"ok": False, "error": "not found"}, 404)
 
@@ -642,7 +738,7 @@ pre#log{background:#080e1c;border:1px solid var(--line);border-radius:11px;paddi
       <span style="font-size:13.5px;color:var(--sub)">每天</span>
       <input id="in-time" type="time" value="08:05">
       <button class="primary sm" id="btn-task" onclick="installTask()">✅ 开启</button>
-      <button class="danger sm" onclick="removeTask()">✖ 关闭</button>
+      <button class="danger sm" id="btn-task-remove" onclick="removeTask()">✖ 关闭</button>
       <span id="task-detail" style="font-size:12.5px;color:var(--sub)"></span>
     </div>
     <div class="hint">
@@ -711,6 +807,8 @@ pre#log{background:#080e1c;border:1px solid var(--line);border-radius:11px;paddi
 
 <script>
 const $=id=>document.getElementById(id);
+const CSRF='__BB_CSRF_TOKEN__';
+let TASK_BUSY=false;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let ACCOUNTS=[], EDIT_ID=null;
 /* 访问令牌: 首次从 URL ?token= 读取并记住,之后所有请求携带 X-Token 头 */
@@ -728,7 +826,7 @@ function busy(btn,on,text){
   else{btn.disabled=false;if(btn._txt)btn.innerHTML=btn._txt;}
 }
 async function post(url,data){
-  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Token':TOKEN},body:JSON.stringify(data||{})});
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Token':TOKEN,'X-CSRF-Token':CSRF},body:JSON.stringify(data||{})});
   return r.json();
 }
 function fmtTime(iso){
@@ -920,17 +1018,28 @@ async function saveModal(){
 
 /* ================= 计划任务 / 日志 ================= */
 async function installTask(){
+  if(TASK_BUSY)return;
+  TASK_BUSY=true;
   const b=$('btn-task');busy(b,true,'注册中…');
+  $('btn-task-remove').disabled=true;
   try{
     const j=await post('/api/task',{time:$('in-time').value||'08:05'});
     toast(j.message||String(j),!j.ok,9000);
     await loadState();
   }catch(e){toast('请求失败: '+e,true);}
-  finally{busy(b,false);}
+  finally{busy(b,false);$('btn-task-remove').disabled=false;TASK_BUSY=false;}
 }
 async function removeTask(){
-  const j=await post('/api/task/remove',{});
-  toast(j.message||'已处理',!j.ok);loadState();
+  if(TASK_BUSY)return;
+  if(!confirm('确定停止所有账号的自动签到吗？这会移除每日任务、重启补签及轮询任务,之后不会自动签到。'))return;
+  TASK_BUSY=true;
+  const b=$('btn-task-remove');busy(b,true,'停止中…');
+  $('btn-task').disabled=true;
+  try{
+    const j=await post('/api/task/remove',{confirm:'stop-schedule'});
+    toast(j.message||'已处理',!j.ok);await loadState();
+  }catch(e){toast('请求失败: '+e,true);}
+  finally{busy(b,false);$('btn-task').disabled=false;TASK_BUSY=false;}
 }
 async function loadLogs(){
   try{
@@ -953,7 +1062,7 @@ setInterval(()=>loadLogs(),60000);
 # 启动
 # ----------------------------------------------------------------------------
 def main() -> int:
-    global TOKEN
+    global TOKEN, TRUST_PROXY
 
     try:
         import sys
@@ -967,7 +1076,10 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=None, help="监听端口(默认 8765)")
     ap.add_argument("--token", default=None,
                     help="访问令牌;绑定非回环地址时必带(未提供则自动生成)")
+    ap.add_argument("--trust-proxy", action="store_true",
+                    help="信任本机反向代理设置的 X-Forwarded-Proto/X-Real-IP(反代必须覆盖这些头)")
     args = ap.parse_args()
+    TRUST_PROXY = args.trust_proxy
 
     host = args.host or HOST
     port = args.port or PORT
